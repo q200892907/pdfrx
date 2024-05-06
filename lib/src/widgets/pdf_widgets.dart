@@ -220,6 +220,7 @@ class _PdfPageViewState extends State<PdfPageView> {
 
   @override
   void dispose() {
+    _image?.dispose();
     _cancellationToken?.cancel();
     super.dispose();
   }
@@ -240,11 +241,11 @@ class _PdfPageViewState extends State<PdfPageView> {
               decoration: widget.decoration ??
                   BoxDecoration(
                     color: widget.backgroundColor ?? Colors.white,
-                    boxShadow: [
+                    boxShadow: const [
                       BoxShadow(
-                        color: Colors.black.withOpacity(0.5),
+                        color: Colors.black54,
                         blurRadius: 4,
-                        offset: const Offset(2, 2),
+                        offset: Offset(2, 2),
                       ),
                     ],
                   ),
@@ -319,10 +320,11 @@ class _PdfPageViewState extends State<PdfPageView> {
     if (pageImage == null) return;
     final newImage = await pageImage.createImage();
     pageImage.dispose();
+    final oldImage = _image;
+    _image = newImage;
+    oldImage?.dispose();
     if (mounted) {
-      setState(() {
-        _image = newImage;
-      });
+      setState(() {});
     }
   }
 }

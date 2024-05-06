@@ -12,13 +12,11 @@ import 'package:rxdart/rxdart.dart';
 import 'package:synchronized/extension.dart';
 import 'package:vector_math/vector_math_64.dart' as vec;
 
-import '../pdf_api.dart';
-import '../pdf_document_ref.dart';
+import '../../pdfrx.dart';
 import 'interactive_viewer.dart' as iv;
 import 'pdf_error_widget.dart';
 import 'pdf_page_links_overlay.dart';
 import 'pdf_page_text_overlay.dart';
-import 'pdf_viewer_params.dart';
 
 /// A widget to display PDF document.
 ///
@@ -100,6 +98,7 @@ class PdfViewer extends StatefulWidget {
   /// [params] is the parameters to customize the viewer.
   /// [initialPageNumber] is the page number to show initially.
   /// [preferRangeAccess] to prefer range access to download the PDF. The default is false.
+  /// [headers] is used to specify additional HTTP headers especially for authentication/authorization.
   PdfViewer.uri(
     Uri uri, {
     PdfPasswordProvider? passwordProvider,
@@ -109,11 +108,13 @@ class PdfViewer extends StatefulWidget {
     this.params = const PdfViewerParams(),
     this.initialPageNumber = 1,
     bool preferRangeAccess = false,
+    Map<String, String>? headers,
   }) : documentRef = PdfDocumentRefUri(
           uri,
           passwordProvider: passwordProvider,
           firstAttemptByEmptyPassword: firstAttemptByEmptyPassword,
           preferRangeAccess: preferRangeAccess,
+          headers: headers,
         );
 
   /// Create [PdfViewer] from a byte data.
@@ -204,11 +205,18 @@ class _PdfViewerState extends State<PdfViewer>
   Size? _viewSize;
   double? _coverScale;
   double? _alternativeFitScale;
+  static const _defaultMinScale = 0.1;
+  double _minScale = _defaultMinScale;
   int? _pageNumber;
   bool _initialized = false;
   final List<double> _zoomStops = [1.0];
 
-  final _realSized = <int, ({ui.Image image, double scale})>{};
+  final _pageImages = <int, _PdfImageWithScale>{};
+  final _pageImageRenderingTimers = <int, Timer>{};
+  final _pageImagesPartial = <int, _PdfImageWithScaleAndRect>{};
+  final _cancellationTokens = <int, List<PdfPageRenderCancellationToken>>{};
+  final _pageImagePartialRenderingRequests =
+      <int, _PdfPartialImageRenderingRequest>{};
 
   final _stream = BehaviorSubject<Matrix4>();
 
@@ -235,7 +243,7 @@ class _PdfViewerState extends State<PdfViewer>
       if (widget.params.doChangesRequireReload(oldWidget?.params)) {
         if (widget.params.annotationRenderingMode !=
             oldWidget?.params.annotationRenderingMode) {
-          _realSized.clear();
+          _releaseAllImages();
         }
         _relayoutPages();
 
@@ -255,9 +263,28 @@ class _PdfViewerState extends State<PdfViewer>
     _onDocumentChanged();
   }
 
+  void _releaseAllImages() {
+    for (final timer in _pageImageRenderingTimers.values) {
+      timer.cancel();
+    }
+    _pageImageRenderingTimers.clear();
+    for (final request in _pageImagePartialRenderingRequests.values) {
+      request.cancel();
+    }
+    _pageImagePartialRenderingRequests.clear();
+    for (final image in _pageImages.values) {
+      image.image.dispose();
+    }
+    _pageImages.clear();
+    for (final image in _pageImagesPartial.values) {
+      image.image.dispose();
+    }
+    _pageImagesPartial.clear();
+  }
+
   void _relayout() {
     _relayoutPages();
-    _realSized.clear();
+    _releaseAllImages();
     if (mounted) {
       setState(() {});
     }
@@ -266,7 +293,7 @@ class _PdfViewerState extends State<PdfViewer>
   void _onDocumentChanged() async {
     _layout = null;
 
-    _realSized.clear();
+    _releaseAllImages();
     _pageNumber = null;
     _initialized = false;
     _txController.removeListener(_onMatrixChanged);
@@ -308,7 +335,7 @@ class _PdfViewerState extends State<PdfViewer>
     _cancelAllPendingRenderings();
     _animController.dispose();
     widget.documentRef.resolveListenable().removeListener(_onDocumentChanged);
-    _realSized.clear();
+    _releaseAllImages();
     _txController.removeListener(_onMatrixChanged);
     _controller?._attach(null);
     _txController.dispose();
@@ -376,7 +403,7 @@ class _PdfViewerState extends State<PdfViewer>
       return Container(
         color: widget.params.backgroundColor,
         child: Focus(
-          onKeyEvent: _onKey,
+          onKeyEvent: _onKeyEvent,
           child: StreamBuilder(
               stream: _stream,
               builder: (context, snapshot) {
@@ -429,7 +456,7 @@ class _PdfViewerState extends State<PdfViewer>
       ? HardwareKeyboard.instance.isMetaPressed
       : HardwareKeyboard.instance.isControlPressed;
 
-  KeyEventResult _onKey(FocusNode node, KeyEvent event) {
+  KeyEventResult _onKeyEvent(FocusNode node, KeyEvent event) {
     final isDown = event is KeyDownEvent;
     switch (event.logicalKey) {
       case LogicalKeyboardKey.pageUp:
@@ -449,7 +476,8 @@ class _PdfViewerState extends State<PdfViewer>
         return KeyEventResult.handled;
       case LogicalKeyboardKey.end:
         if (isDown) {
-          _goToPageRangeChecked(_document!.pages.length);
+          _goToPageRangeChecked(_document!.pages.length,
+              anchor: widget.params.pageAnchorEnd);
         }
         return KeyEventResult.handled;
       case LogicalKeyboardKey.equal:
@@ -490,9 +518,18 @@ class _PdfViewerState extends State<PdfViewer>
     return KeyEventResult.ignored;
   }
 
-  Future<void> _goToPageRangeChecked(int pageNumber) async {
-    _gotoTargetPageNumber = pageNumber.clamp(1, _document!.pages.length);
-    await _goToPage(pageNumber: _gotoTargetPageNumber!);
+  Future<void> _goToPageRangeChecked(int pageNumber,
+      {PdfPageAnchor? anchor}) async {
+    final pageCount = _document!.pages.length;
+    if (pageNumber < 1) {
+      _gotoTargetPageNumber = 1;
+    } else if (pageNumber > pageCount) {
+      _gotoTargetPageNumber = pageCount;
+      anchor ??= widget.params.pageAnchorEnd;
+    } else {
+      _gotoTargetPageNumber = pageNumber;
+    }
+    await _goToPage(pageNumber: _gotoTargetPageNumber!, anchor: anchor);
   }
 
   Future<void> _goToManipulated(void Function(Matrix4 m) manipulate) async {
@@ -515,25 +552,37 @@ class _PdfViewerState extends State<PdfViewer>
   Rect get _visibleRect => _txController.value.calcVisibleRect(_viewSize!);
 
   void _determineCurrentPage() {
-    final visibleRect = _visibleRect;
-    int? pageNumberMaxInt;
-    double maxIntersection = 0;
-    for (int i = 0; i < _document!.pages.length; i++) {
-      final rect = _layout!.pageLayouts[i];
-      final intersection = rect.intersect(visibleRect);
-      if (intersection.isEmpty) continue;
-      final intersectionArea = intersection.width * intersection.height;
-      if (intersectionArea > maxIntersection) {
-        maxIntersection = intersectionArea;
-        pageNumberMaxInt = i + 1;
-      }
-    }
-    if (_pageNumber != pageNumberMaxInt) {
-      _pageNumber = pageNumberMaxInt;
+    final pageNumber = _guessCurrentPage();
+    if (pageNumber != null && _pageNumber != pageNumber) {
+      _pageNumber = pageNumber;
       if (widget.params.onPageChanged != null) {
         Future.microtask(() => widget.params.onPageChanged?.call(_pageNumber));
       }
     }
+  }
+
+  int? _guessCurrentPage() {
+    if (widget.params.calculateCurrentPageNumber != null) {
+      return widget.params.calculateCurrentPageNumber!(
+          _visibleRect, _layout!.pageLayouts, _controller!);
+    }
+    if (_layout != null) {
+      final visibleRect = _visibleRect;
+      int? pageNumber;
+      double pageIntersectionArea = 0;
+      for (int i = 0; i < _document!.pages.length; i++) {
+        final rect = _layout!.pageLayouts[i];
+        final intersection = rect.intersect(visibleRect);
+        if (intersection.isEmpty) continue;
+        final intersectionArea = intersection.width * intersection.height;
+        if (intersectionArea > pageIntersectionArea) {
+          pageIntersectionArea = intersectionArea;
+          pageNumber = i + 1;
+        }
+        return pageNumber;
+      }
+    }
+    return null;
   }
 
   bool _calcAlternativeFitScale() {
@@ -543,11 +592,20 @@ class _PdfViewerState extends State<PdfViewer>
       final m2 = params.margin * 2;
       _alternativeFitScale = min((_viewSize!.width - m2) / rect.width,
           (_viewSize!.height - m2) / rect.height);
-      return true;
     } else {
       _alternativeFitScale = null;
+    }
+    if (_coverScale == null) {
+      _minScale = _defaultMinScale;
       return false;
     }
+
+    _minScale = !widget.params.useAlternativeFitScaleAsMinScale
+        ? widget.params.minScale
+        : _alternativeFitScale == null
+            ? _coverScale!
+            : min(_coverScale!, _alternativeFitScale!);
+    return _alternativeFitScale != null;
   }
 
   void _calcZoomStopTable() {
@@ -570,9 +628,23 @@ class _PdfViewerState extends State<PdfViewer>
       _zoomStops.add(1.0);
       return;
     }
-    while (z < PdfViewerController.maxZoom) {
+    while (z < widget.params.maxScale) {
       _zoomStops.add(z);
       z *= 2;
+    }
+    if (!_areZoomsAlmostIdentical(z, widget.params.maxScale)) {
+      _zoomStops.add(widget.params.maxScale);
+    }
+
+    if (!widget.params.useAlternativeFitScaleAsMinScale) {
+      z = _zoomStops.first;
+      while (z > widget.params.minScale) {
+        z /= 2;
+        _zoomStops.insert(0, z);
+      }
+      if (!_areZoomsAlmostIdentical(z, widget.params.minScale)) {
+        _zoomStops.insert(0, widget.params.minScale);
+      }
     }
   }
 
@@ -611,6 +683,9 @@ class _PdfViewerState extends State<PdfViewer>
     final textWidgets = <Widget>[];
     final overlayWidgets = <Widget>[];
     final targetRect = _getCacheExtentRect();
+    final selectionAreaInjector = widget.params.perPageSelectionAreaInjector ??
+        (page, child) => SelectionArea(child: child);
+
     for (int i = 0; i < _document!.pages.length; i++) {
       final rect = _layout!.pageLayouts[i];
       final intersection = rect.intersect(targetRect);
@@ -647,8 +722,9 @@ class _PdfViewerState extends State<PdfViewer>
               top: rectExternal.top,
               width: rectExternal.width,
               height: rectExternal.height,
-              child: SelectionArea(
-                child: Builder(builder: (context) {
+              child: selectionAreaInjector(
+                page,
+                Builder(builder: (context) {
                   final registrar = SelectionContainer.maybeOf(context);
                   return PdfPageTextOverlay(
                     key: Key('pageText:${page.pageNumber}'),
@@ -716,8 +792,6 @@ class _PdfViewerState extends State<PdfViewer>
         renderBox.globalToLocal(tl), renderBox.globalToLocal(br));
   }
 
-  final _cancellationTokens = <int, List<PdfPageRenderCancellationToken>>{};
-
   void _addCancellationToken(
       int pageNumber, PdfPageRenderCancellationToken token) {
     var tokens = _cancellationTokens.putIfAbsent(pageNumber, () => []);
@@ -744,12 +818,11 @@ class _PdfViewerState extends State<PdfViewer>
   /// [_CustomPainter] calls the function to paint PDF pages.
   void _customPaint(ui.Canvas canvas, ui.Size size) {
     final targetRect = _getCacheExtentRect();
-    final double globalScale = min(
-      MediaQuery.of(context).devicePixelRatio * _currentZoom,
-      300.0 / 72.0,
-    );
+    final scale = MediaQuery.of(context).devicePixelRatio * _currentZoom;
 
     final unusedPageList = <int>[];
+    final dropShadowPaint = widget.params.pageDropShadow?.toPaint()
+      ?..style = PaintingStyle.fill;
 
     for (int i = 0; i < _document!.pages.length; i++) {
       final rect = _layout!.pageLayouts[i];
@@ -757,17 +830,36 @@ class _PdfViewerState extends State<PdfViewer>
       if (intersection.isEmpty) {
         final page = _document!.pages[i];
         _cancelPendingRenderings(page.pageNumber);
-        unusedPageList.add(i + 1);
+        if (_pageImages.containsKey(i + 1)) {
+          unusedPageList.add(i + 1);
+        }
         continue;
       }
 
       final page = _document!.pages[i];
-      var realSize = _realSized[page.pageNumber];
-      final scale = widget.params.getPageRenderingScale
-              ?.call(context, page, _controller!, globalScale) ??
-          globalScale;
-      if (realSize == null || realSize.scale != scale) {
-        _ensureRealSizeCached(page, scale);
+      final realSize = _pageImages[page.pageNumber];
+      final partial = _pageImagesPartial[page.pageNumber];
+
+      final scaleLimit = widget.params.getPageRenderingScale?.call(
+              context,
+              page,
+              _controller!,
+              widget.params.onePassRenderingScaleThreshold) ??
+          widget.params.onePassRenderingScaleThreshold;
+
+      if (dropShadowPaint != null) {
+        final offset = widget.params.pageDropShadow!.offset;
+        final spread = widget.params.pageDropShadow!.spreadRadius;
+        final shadowRect = rect
+            .translate(offset.dx, offset.dy)
+            .inflateHV(horizontal: spread, vertical: spread);
+        canvas.drawRect(shadowRect, dropShadowPaint);
+      }
+
+      if (widget.params.pageBackgroundPaintCallbacks != null) {
+        for (final callback in widget.params.pageBackgroundPaintCallbacks!) {
+          callback(canvas, rect, page);
+        }
       }
 
       if (realSize != null) {
@@ -789,12 +881,29 @@ class _PdfViewerState extends State<PdfViewer>
               ..color = Colors.white
               ..style = PaintingStyle.fill);
       }
-      canvas.drawRect(
-          rect,
-          Paint()
-            ..color = Colors.black
-            ..strokeWidth = 0.2
-            ..style = PaintingStyle.stroke);
+
+      final scaleLimited = min(scale, scaleLimit);
+
+      if (realSize == null || realSize.scale != scaleLimited) {
+        _requestPageImageCached(page, scaleLimited);
+      }
+      if (scale > scaleLimit) {
+        _requestPartialImage(page, scale);
+      }
+
+      if (scale > scaleLimit && partial != null) {
+        canvas.drawImageRect(
+          partial.image,
+          Rect.fromLTWH(
+            0,
+            0,
+            partial.image.width.toDouble(),
+            partial.image.height.toDouble(),
+          ),
+          partial.rect,
+          Paint()..filterQuality = FilterQuality.high,
+        );
+      }
 
       if (widget.params.pagePaintCallbacks != null) {
         for (final callback in widget.params.pagePaintCallbacks!) {
@@ -844,16 +953,36 @@ class _PdfViewerState extends State<PdfViewer>
 
   void _invalidate() => _stream.add(_txController.value);
 
-  Future<void> _ensureRealSizeCached(PdfPage page, double scale) async {
+  Future<void> _requestPageImageCached(PdfPage page, double scale) async {
     final width = page.width * scale;
     final height = page.height * scale;
     if (width < 1 || height < 1) return;
 
-    if (_realSized[page.pageNumber]?.scale == scale) return;
+    // if this is the first time to render the page, render it immediately
+    if (!_pageImages.containsKey(page.pageNumber)) {
+      _cachePageImage(page, width, height, scale);
+      return;
+    }
+
+    _pageImageRenderingTimers[page.pageNumber]?.cancel();
+    _pageImageRenderingTimers[page.pageNumber] = Timer(
+      const Duration(milliseconds: 50),
+      () => _cachePageImage(page, width, height, scale),
+    );
+  }
+
+  Future<void> _cachePageImage(
+    PdfPage page,
+    double width,
+    double height,
+    double scale,
+  ) async {
+    if (_pageImages[page.pageNumber]?.scale == scale) return;
     final cancellationToken = page.createCancellationToken();
     _addCancellationToken(page.pageNumber, cancellationToken);
     await synchronized(() async {
-      if (_realSized[page.pageNumber]?.scale == scale) return;
+      if (cancellationToken.isCanceled) return;
+      if (_pageImages[page.pageNumber]?.scale == scale) return;
       final img = await page.render(
         fullWidth: width,
         fullHeight: height,
@@ -862,10 +991,69 @@ class _PdfViewerState extends State<PdfViewer>
         cancellationToken: cancellationToken,
       );
       if (img == null) return;
-      _realSized[page.pageNumber] =
-          (image: await img.createImage(), scale: scale);
+      final newImage = _PdfImageWithScale(await img.createImage(), scale);
+      _pageImages[page.pageNumber]?.dispose();
+      _pageImages[page.pageNumber] = newImage;
       img.dispose();
       _invalidate();
+    });
+  }
+
+  Future<void> _requestPartialImage(PdfPage page, double scale) async {
+    _pageImagePartialRenderingRequests[page.pageNumber]?.cancel();
+    final cancellationToken = page.createCancellationToken();
+    _pageImagePartialRenderingRequests[page.pageNumber] =
+        _PdfPartialImageRenderingRequest(
+      Timer(
+        const Duration(milliseconds: 300),
+        () async {
+          final newImage =
+              await _createPartialImage(page, scale, cancellationToken);
+          if (_pageImagesPartial[page.pageNumber] == newImage) return;
+          _pageImagesPartial.remove(page.pageNumber)?.dispose();
+          if (newImage != null) {
+            _pageImagesPartial[page.pageNumber] = newImage;
+          }
+          _invalidate();
+        },
+      ),
+      cancellationToken,
+    );
+  }
+
+  Future<_PdfImageWithScaleAndRect?> _createPartialImage(
+    PdfPage page,
+    double scale,
+    PdfPageRenderCancellationToken cancellationToken,
+  ) async {
+    final pageRect = _layout!.pageLayouts[page.pageNumber - 1];
+    final rect = pageRect.intersect(_visibleRect);
+    final prev = _pageImagesPartial[page.pageNumber];
+    if (prev?.rect == rect && prev?.scale == scale) return prev;
+    if (rect.width < 1 || rect.height < 1) return null;
+    final inPageRect = rect.translate(-pageRect.left, -pageRect.top);
+
+    return await synchronized(() async {
+      if (cancellationToken.isCanceled) {
+        return null;
+      }
+
+      final img = await page.render(
+        x: (inPageRect.left * scale).toInt(),
+        y: (inPageRect.top * scale).toInt(),
+        width: (inPageRect.width * scale).toInt(),
+        height: (inPageRect.height * scale).toInt(),
+        fullWidth: pageRect.width * scale,
+        fullHeight: pageRect.height * scale,
+        backgroundColor: Colors.white,
+        annotationRenderingMode: widget.params.annotationRenderingMode,
+        cancellationToken: cancellationToken,
+      );
+      if (img == null) return null;
+      final result =
+          _PdfImageWithScaleAndRect(await img.createImage(), scale, rect);
+      img.dispose();
+      return result;
     });
   }
 
@@ -874,19 +1062,30 @@ class _PdfViewerState extends State<PdfViewer>
     int acceptableBytes,
     PdfPage currentPage,
   ) {
-    double dist(int pageNumber) =>
-        (_layout!.pageLayouts[pageNumber - 1].center -
-                _layout!.pageLayouts[currentPage.pageNumber - 1].center)
-            .distanceSquared;
+    double dist(int pageNumber) {
+      return (_layout!.pageLayouts[pageNumber - 1].center -
+              _layout!.pageLayouts[currentPage.pageNumber - 1].center)
+          .distanceSquared;
+    }
 
     pageNumbers.sort((a, b) => dist(b).compareTo(dist(a)));
     int getBytesConsumed(ui.Image? image) =>
         image == null ? 0 : (image.width * image.height * 4).toInt();
-    int bytesConsumed =
-        _realSized.values.fold(0, (sum, e) => sum + getBytesConsumed(e.image));
+    int bytesConsumed = _pageImages.values
+            .fold(0, (sum, e) => sum + getBytesConsumed(e.image)) +
+        _pageImagesPartial.values
+            .fold(0, (sum, e) => sum + getBytesConsumed(e.image));
     for (final key in pageNumbers) {
-      _realSized.remove(key);
-      bytesConsumed -= getBytesConsumed(_realSized[key]?.image);
+      final removed = _pageImages.remove(key);
+      if (removed != null) {
+        bytesConsumed -= getBytesConsumed(removed.image);
+        removed.image.dispose();
+      }
+      final removedPartial = _pageImagesPartial.remove(key);
+      if (removedPartial != null) {
+        bytesConsumed -= getBytesConsumed(removedPartial.image);
+        removedPartial.image.dispose();
+      }
       if (bytesConsumed <= acceptableBytes) {
         break;
       }
@@ -936,9 +1135,7 @@ class _PdfViewerState extends State<PdfViewer>
   }
 
   /// The minimum zoom ratio allowed.
-  double get minScale => _alternativeFitScale == null
-      ? _coverScale!
-      : min(_coverScale!, _alternativeFitScale!);
+  double get minScale => _minScale;
 
   Matrix4 _calcMatrixForRect(Rect rect, {double? zoomMax, double? margin}) {
     margin ??= 0;
@@ -1263,6 +1460,32 @@ class _PdfViewerState extends State<PdfViewer>
       .translate(_txController.value.xZoomed, _txController.value.yZoomed));
 }
 
+class _PdfPartialImageRenderingRequest {
+  _PdfPartialImageRenderingRequest(this.timer, this.cancellationToken);
+  final Timer timer;
+  final PdfPageRenderCancellationToken cancellationToken;
+
+  void cancel() {
+    timer.cancel();
+    cancellationToken.cancel();
+  }
+}
+
+class _PdfImageWithScale {
+  _PdfImageWithScale(this.image, this.scale);
+  final ui.Image image;
+  final double scale;
+
+  void dispose() {
+    image.dispose();
+  }
+}
+
+class _PdfImageWithScaleAndRect extends _PdfImageWithScale {
+  _PdfImageWithScaleAndRect(super.image, super.scale, this.rect);
+  final Rect rect;
+}
+
 class _PdfViewerTransformationController extends TransformationController {
   _PdfViewerTransformationController(this._state);
 
@@ -1292,8 +1515,6 @@ class PdfViewerController extends ValueListenable<Matrix4> {
   _PdfViewerState? __state;
   final _listeners = <VoidCallback>[];
 
-  static const maxZoom = 8.0;
-
   void _attach(_PdfViewerState? state) {
     __state?._txController.removeListener(_notifyListeners);
     __state = state;
@@ -1306,20 +1527,24 @@ class PdfViewerController extends ValueListenable<Matrix4> {
     }
   }
 
-  _PdfViewerState get _state {
-    return __state!;
-  }
+  _PdfViewerState get _state => __state!;
+
+  /// Get the associated [PdfViewer] widget.
+  PdfViewer get widget => _state.widget;
+
+  /// Get the associated [PdfViewerParams] parameters.
+  PdfViewerParams get params => widget.params;
 
   /// Determine whether the document/pages are ready or not.
   bool get isReady => __state?._document?.pages != null;
 
-  /// Document layout's size.
+  /// The document layout size.
   Size get documentSize => _state._layout!.documentSize;
 
-  /// View port size (The widget's client area's size)
+  /// The view port size (The widget's client area's size)
   Size get viewSize => _state._viewSize!;
 
-  /// The zoom ratio that fits the page width to the view port.
+  /// The zoom ratio that fits the page's smaller side (either horizontal or vertical) to the view port.
   double get coverScale => _state._coverScale!;
 
   /// The zoom ratio that fits whole the page to the view port.

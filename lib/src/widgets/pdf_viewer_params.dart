@@ -14,14 +14,25 @@ class PdfViewerParams {
     this.margin = 8.0,
     this.backgroundColor = Colors.grey,
     this.layoutPages,
-    this.maxScale = 2.5,
+    this.maxScale = 8.0,
     this.minScale = 0.1,
+    this.useAlternativeFitScaleAsMinScale = true,
     this.panAxis = PanAxis.free,
     this.boundaryMargin,
     this.annotationRenderingMode =
         PdfAnnotationRenderingMode.annotationAndForms,
     this.pageAnchor = PdfPageAnchor.topCenter,
+    this.pageAnchorEnd = PdfPageAnchor.bottomCenter,
+    this.onePassRenderingScaleThreshold = 200 / 72,
     this.enableTextSelection = false,
+    this.matchTextColor,
+    this.activeMatchTextColor,
+    this.pageDropShadow = const BoxShadow(
+      color: Colors.black54,
+      blurRadius: 4,
+      spreadRadius: 2,
+      offset: Offset(2, 2),
+    ),
     this.panEnabled = true,
     this.scaleEnabled = true,
     this.onInteractionEnd,
@@ -29,6 +40,7 @@ class PdfViewerParams {
     this.onInteractionUpdate,
     this.onDocumentChanged,
     this.calculateInitialPageNumber,
+    this.calculateCurrentPageNumber,
     this.onViewerReady,
     this.onPageChanged,
     this.getPageRenderingScale,
@@ -44,7 +56,9 @@ class PdfViewerParams {
     this.errorBannerBuilder,
     this.linkWidgetBuilder,
     this.pagePaintCallbacks,
+    this.pageBackgroundPaintCallbacks,
     this.onTextSelectionChange,
+    this.perPageSelectionAreaInjector,
     this.forceReload = false,
   });
 
@@ -86,11 +100,23 @@ class PdfViewerParams {
 
   /// The maximum allowed scale.
   ///
-  /// Defaults to 2.5.
+  /// The default is 8.0.
   final double maxScale;
 
   /// The minimum allowed scale.
+  ///
+  /// The default is 0.1.
+  ///
+  /// Please note that the value is not used if [useAlternativeFitScaleAsMinScale] is true.
+  /// See [useAlternativeFitScaleAsMinScale] for the details.
   final double minScale;
+
+  /// If true, the minimum scale is set to the calculated [PdfViewerController.alternativeFitScale].
+  ///
+  /// If the minimum scale is small value, it makes many pages visible inside the view and it finally
+  /// renders many pages at once. It may make the viewer to be slow or even crash due to high memory consumption.
+  /// So, it is recommended to set this to false if you want to show PDF documents with many pages.
+  final bool useAlternativeFitScaleAsMinScale;
 
   /// See [InteractiveViewer.panAxis] for details.
   final PanAxis panAxis;
@@ -106,9 +132,48 @@ class PdfViewerParams {
   /// Anchor to position the page.
   final PdfPageAnchor pageAnchor;
 
+  /// Anchor to position the page at the end of the page.
+  final PdfPageAnchor pageAnchorEnd;
+
+  /// If a page is rendered over the scale threshold, the page is rendered with the threshold scale
+  /// and actual resolution image is rendered after some delay (progressive rendering).
+  ///
+  /// Basically, if the value is larger, the viewer renders each page in one-pass rendering; it is
+  /// faster and looks better to the user. However, larger value may consume more memory.
+  /// So you may want to set the smaller value to reduce memory consumption.
+  ///
+  /// The default is 200 / 72, which implies rendering at 300 dpi.
+  /// If you want more granular control for each page, use [getPageRenderingScale].
+  final double onePassRenderingScaleThreshold;
+
   /// Experimental: Enable text selection on pages.
   ///
   final bool enableTextSelection;
+
+  /// Color for text search match.
+  ///
+  /// If null, the default color is `Colors.yellow.withOpacity(0.5)`.
+  final Color? matchTextColor;
+
+  /// Color for active text search match.
+  ///
+  /// If null, the default color is `Colors.orange.withOpacity(0.5)`.
+  final Color? activeMatchTextColor;
+
+  /// Drop shadow for the page.
+  ///
+  /// The default is:
+  /// ```dart
+  /// BoxShadow(
+  ///   color: Colors.black54,
+  ///   blurRadius: 4,
+  ///   spreadRadius: 0,
+  ///   offset: Offset(2, 2))
+  /// ```
+  ///
+  /// If you need to remove the shadow, set this to null.
+  /// To customize more of the shadow, you can use [pageBackgroundPaintCallbacks] to paint the shadow manually.
+  final BoxShadow? pageDropShadow;
 
   /// See [InteractiveViewer.panEnabled] for details.
   final bool panEnabled;
@@ -141,15 +206,21 @@ class PdfViewerParams {
   /// It is useful when you want to determine the initial page number based on the document content.
   final PdfViewerCalculateInitialPageNumberFunction? calculateInitialPageNumber;
 
+  /// Function to guess the current page number based on the visible rectangle and page layouts.
+  ///
+  /// The function is used to override the default behavior to calculate the current page number.
+  final PdfViewerCalculateCurrentPageNumberFunction? calculateCurrentPageNumber;
+
   /// Function called when the current page is changed.
   final PdfPageChangedCallback? onPageChanged;
 
   /// Function to customize the rendering scale of the page.
   ///
-  /// In some cases, if [maxScale] is too large, certain pages may not be
-  /// rendered correctly due to memory limitation, or anyway they may take too
-  /// long to render. In such cases, you can use this function to customize the
-  /// rendering scales for such pages.
+  /// In some cases, if [maxScale]/[onePassRenderingScaleThreshold] is too large,
+  /// certain pages may not be rendered correctly due to memory limitation,
+  /// or anyway they may take too long to render.
+  /// In such cases, you can use this function to customize the rendering scales
+  /// for such pages.
   ///
   /// The following fragment is an example of rendering pages always on 300 dpi:
   /// ```dart
@@ -174,7 +245,7 @@ class PdfViewerParams {
   ///   },
   /// ),
   /// ```
-  final PdfViewerParamGetPageRenderingScale? getPageRenderingScale;
+  final PdfViewerGetPageRenderingScale? getPageRenderingScale;
 
   /// Set the scroll amount ratio by mouse wheel. The default is 0.2.
   ///
@@ -261,13 +332,41 @@ class PdfViewerParams {
   /// Build link widget.
   final PdfLinkWidgetBuilder? linkWidgetBuilder;
 
-  /// Page paint callbacks.
+  /// Callback to paint over the rendered page.
   ///
   /// For the detail usage, see [PdfViewerPagePaintCallback].
   final List<PdfViewerPagePaintCallback>? pagePaintCallbacks;
 
+  /// Callback to paint on the background of the rendered page (called before painting the page content).
+  ///
+  /// It is useful to paint some background such as drop shadow of the page.
+  /// For the detail usage, see [PdfViewerPagePaintCallback].
+  final List<PdfViewerPagePaintCallback>? pageBackgroundPaintCallbacks;
+
   /// Function to be notified when the text selection is changed.
   final PdfViewerTextSelectionChangeCallback? onTextSelectionChange;
+
+  /// Function to inject customized [SelectionArea] for page text selection.
+  ///
+  /// You can of course disable page level [SelectionArea] by returning the passed `child` directly.
+  ///
+  /// The following fragment is an example to inject [SelectionArea] with
+  /// [AdaptiveTextSelectionToolbar.selectableRegion] for page text selection:
+  ///
+  /// ```dart
+  /// perPageSelectionAreaInjector: (page, child) {
+  ///   return SelectionArea(
+  ///     contextMenuBuilder: (context, selectableRegionState) {
+  ///       return AdaptiveTextSelectionToolbar.selectableRegion(
+  ///          selectableRegionState: selectableRegionState,
+  ///       );
+  ///     },
+  ///     child: child,
+  ///   );
+  /// },
+  /// ```
+  ///
+  final PerPageSelectionAreaInjector? perPageSelectionAreaInjector;
 
   /// Force reload the viewer.
   ///
@@ -287,11 +386,19 @@ class PdfViewerParams {
         other.backgroundColor != backgroundColor ||
         other.maxScale != maxScale ||
         other.minScale != minScale ||
+        other.useAlternativeFitScaleAsMinScale !=
+            useAlternativeFitScaleAsMinScale ||
         other.panAxis != panAxis ||
         other.boundaryMargin != boundaryMargin ||
         other.annotationRenderingMode != annotationRenderingMode ||
         other.pageAnchor != pageAnchor ||
+        other.pageAnchorEnd != pageAnchorEnd ||
+        other.onePassRenderingScaleThreshold !=
+            onePassRenderingScaleThreshold ||
         other.enableTextSelection != enableTextSelection ||
+        other.matchTextColor != matchTextColor ||
+        other.activeMatchTextColor != activeMatchTextColor ||
+        other.pageDropShadow != pageDropShadow ||
         other.panEnabled != panEnabled ||
         other.scaleEnabled != scaleEnabled ||
         other.scrollByMouseWheel != scrollByMouseWheel ||
@@ -309,11 +416,19 @@ class PdfViewerParams {
         other.backgroundColor == backgroundColor &&
         other.maxScale == maxScale &&
         other.minScale == minScale &&
+        other.useAlternativeFitScaleAsMinScale ==
+            useAlternativeFitScaleAsMinScale &&
         other.panAxis == panAxis &&
         other.boundaryMargin == boundaryMargin &&
         other.annotationRenderingMode == annotationRenderingMode &&
         other.pageAnchor == pageAnchor &&
+        other.pageAnchorEnd == pageAnchorEnd &&
+        other.onePassRenderingScaleThreshold ==
+            onePassRenderingScaleThreshold &&
         other.enableTextSelection == enableTextSelection &&
+        other.matchTextColor == matchTextColor &&
+        other.activeMatchTextColor == activeMatchTextColor &&
+        other.pageDropShadow == pageDropShadow &&
         other.panEnabled == panEnabled &&
         other.scaleEnabled == scaleEnabled &&
         other.onInteractionEnd == onInteractionEnd &&
@@ -321,6 +436,7 @@ class PdfViewerParams {
         other.onInteractionUpdate == onInteractionUpdate &&
         other.onDocumentChanged == onDocumentChanged &&
         other.calculateInitialPageNumber == calculateInitialPageNumber &&
+        other.calculateCurrentPageNumber == calculateCurrentPageNumber &&
         other.onViewerReady == onViewerReady &&
         other.onPageChanged == onPageChanged &&
         other.getPageRenderingScale == getPageRenderingScale &&
@@ -335,7 +451,9 @@ class PdfViewerParams {
         other.errorBannerBuilder == errorBannerBuilder &&
         other.linkWidgetBuilder == linkWidgetBuilder &&
         other.pagePaintCallbacks == pagePaintCallbacks &&
+        other.pageBackgroundPaintCallbacks == pageBackgroundPaintCallbacks &&
         other.onTextSelectionChange == onTextSelectionChange &&
+        other.perPageSelectionAreaInjector == perPageSelectionAreaInjector &&
         other.forceReload == forceReload;
   }
 
@@ -345,11 +463,17 @@ class PdfViewerParams {
         backgroundColor.hashCode ^
         maxScale.hashCode ^
         minScale.hashCode ^
+        useAlternativeFitScaleAsMinScale.hashCode ^
         panAxis.hashCode ^
         boundaryMargin.hashCode ^
         annotationRenderingMode.hashCode ^
         pageAnchor.hashCode ^
+        pageAnchorEnd.hashCode ^
+        onePassRenderingScaleThreshold.hashCode ^
         enableTextSelection.hashCode ^
+        matchTextColor.hashCode ^
+        activeMatchTextColor.hashCode ^
+        pageDropShadow.hashCode ^
         panEnabled.hashCode ^
         scaleEnabled.hashCode ^
         onInteractionEnd.hashCode ^
@@ -357,6 +481,7 @@ class PdfViewerParams {
         onInteractionUpdate.hashCode ^
         onDocumentChanged.hashCode ^
         calculateInitialPageNumber.hashCode ^
+        calculateCurrentPageNumber.hashCode ^
         onViewerReady.hashCode ^
         onPageChanged.hashCode ^
         getPageRenderingScale.hashCode ^
@@ -371,7 +496,9 @@ class PdfViewerParams {
         errorBannerBuilder.hashCode ^
         linkWidgetBuilder.hashCode ^
         pagePaintCallbacks.hashCode ^
+        pageBackgroundPaintCallbacks.hashCode ^
         onTextSelectionChange.hashCode ^
+        perPageSelectionAreaInjector.hashCode ^
         forceReload.hashCode;
   }
 }
@@ -384,6 +511,13 @@ typedef PdfViewerDocumentChangedCallback = void Function(PdfDocument? document);
 /// If the function returns null, the viewer will show the page of [PdfViewer.initialPageNumber].
 typedef PdfViewerCalculateInitialPageNumberFunction = int? Function(
   PdfDocument document,
+  PdfViewerController controller,
+);
+
+/// Function to guess the current page number based on the visible rectangle and page layouts.
+typedef PdfViewerCalculateCurrentPageNumberFunction = int? Function(
+  Rect visibleRect,
+  List<Rect> pageRects,
   PdfViewerController controller,
 );
 
@@ -403,7 +537,7 @@ typedef PdfPageChangedCallback = void Function(int? pageNumber);
 /// - [page] can be used to determine the page dimensions
 /// - [controller] can be used to get the current zoom by [PdfViewerController.currentZoom]
 /// - [estimatedScale] is the precalculated scale for the page
-typedef PdfViewerParamGetPageRenderingScale = double? Function(
+typedef PdfViewerGetPageRenderingScale = double? Function(
   BuildContext context,
   PdfPage page,
   PdfViewerController controller,
@@ -479,6 +613,13 @@ typedef PdfViewerPagePaintCallback = void Function(
 /// Otherwise, [selection] is the selected text ranges. If no selection is made, [selection] is an empty list.
 typedef PdfViewerTextSelectionChangeCallback = void Function(
     PdfTextRanges? selection);
+
+/// Function to inject customized [SelectionArea] for page text selection.
+///
+/// [page] is the page to inject the selection area.
+/// [child] is the child widget to apply the selection area.
+typedef PerPageSelectionAreaInjector = Widget Function(
+    PdfPage page, Widget child);
 
 /// When [PdfViewerController.goToPage] is called, the page is aligned to the specified anchor.
 ///

@@ -5,8 +5,8 @@ if [ "$2" = "" ]; then
   exit 1
 fi
 
-# https://pdfium.googlesource.com/pdfium/+/refs/heads/chromium/6150
-LAST_KNOWN_GOOD_COMMIT=1e9d89db3c00fd1eab2959bd063832bebe6b868d
+# https://pdfium.googlesource.com/pdfium/+/refs/heads/chromium/6406
+LAST_KNOWN_GOOD_COMMIT=b756612c7933bafd2d21d8d60c2cbcc46978594c
 
 SCRIPT_DIR=$(cd $(dirname $0) && pwd)
 
@@ -129,7 +129,7 @@ if [[ "$TARGET_OS" == "ios" ]]; then
   # See ios/pdfium/.tmp/work/pdfium/build/config/ios/rules.gni
   cat <<EOF >> $BUILDDIR/args.gn
 ios_enable_code_signing = false
-ios_deployment_target = "13.0"
+ios_deployment_target = "12.0"
 use_custom_libcxx = false
 pdf_use_partition_alloc = false
 target_environment = "$TARGET_ENVIRONMENT"
